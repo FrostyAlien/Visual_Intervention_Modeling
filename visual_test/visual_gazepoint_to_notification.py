@@ -73,16 +73,24 @@ class VisualSimulationEnv(gym.Env):
                     ),  # Full screen (height, width, channels)
                     dtype=np.uint8,
                 ),
+                # old position space (commented out)
+                # "position": spaces.Box(
+                #     low=np.array([0, 0], dtype=np.float32),
+                #     high=np.array([SCREEN_WIDTH, SCREEN_HEIGHT], dtype=np.float32),
+                #     shape=(2,),  # Agent's x, y position
+                #     dtype=np.float32,
+                # ),
+                # New position history space for LSTM
                 "position": spaces.Box(
-                    low=np.array([0, 0], dtype=np.float32),
-                    high=np.array([SCREEN_WIDTH, SCREEN_HEIGHT], dtype=np.float32),
-                    shape=(2,),  # Agent's x, y position
+                    low=np.array([[0, 0]] * 10, dtype=np.float32),
+                    high=np.array([[SCREEN_WIDTH, SCREEN_HEIGHT]] * 10, dtype=np.float32),
+                    shape=(10, 2),  # History of agent's x, y positions (last 10 steps)
                     dtype=np.float32,
                 ),
                 "action_history": spaces.Box(
                     low=0,
                     high=255,
-                    shape=(10,),
+                    shape=(10,),    # last 10 actions
                     dtype=np.uint8,
                 ),
             }
@@ -152,6 +160,10 @@ class VisualSimulationEnv(gym.Env):
         self.action_history = np.full(
             10, 255, dtype=np.uint8
         )  # Reset action history with 255 (no action)
+        
+        # Initialize position history with current position repeated 10 times
+        # might not be the best way to do this, but we do it for now to solve the runtime error
+        self.position_history = np.tile(self.agent_pos, (10, 1)).astype(np.float32)
 
         # Process and handle events to avoid pygame becoming unresponsive
         if self.render_mode == "human":
@@ -246,6 +258,10 @@ class VisualSimulationEnv(gym.Env):
             [AGENT_RADIUS, AGENT_RADIUS],
             [SCREEN_WIDTH - AGENT_RADIUS, SCREEN_HEIGHT - AGENT_RADIUS],
         )
+        
+        # Update position history
+        self.position_history = np.roll(self.position_history, 1, axis=0)
+        self.position_history[0] = self.agent_pos
 
         # Calculate movement distance
         # move_distance = np.linalg.norm(self.agent_pos - prev_pos)
@@ -313,7 +329,8 @@ class VisualSimulationEnv(gym.Env):
         # Return both visual observation and position information
         return {
             "visual": visual_obs,
-            "position": self.agent_pos.astype(np.float32),
+            # "position": self.agent_pos.astype(np.float32),  # Old single position
+            "position": self.position_history,
             "action_history": self.action_history,
         }
 
@@ -445,13 +462,18 @@ class VisionExtractor(BaseFeaturesExtractor):
         n_input_channels = observation_space["visual"].shape[
             0
         ]  # Channels are first in CHW format
-        pos_dim = observation_space["position"].shape[0]
+        # old position dimension
+        # pos_dim = observation_space["position"].shape[0]
+        
+        # Position dimensions - now a sequence of positions for LSTM
+        pos_shape = observation_space["position"].shape
+        pos_dim = pos_shape[1]      # Dimension of each position (2)
         action_history_dim = observation_space["action_history"].shape[0]
 
         self.cnn = th.nn.Sequential(
             th.nn.Conv2d(
                 n_input_channels, 32, 8, stride=4
-            ),  # Larger kernel for full-screen input
+            ),
             th.nn.ReLU(),
             th.nn.Conv2d(32, 64, 4, stride=2),
             th.nn.ReLU(),
@@ -468,8 +490,17 @@ class VisionExtractor(BaseFeaturesExtractor):
             n_flatten = self.cnn(sample).shape[1]
             # print(f"Flattened features size: {n_flatten}")
 
-        # Create a network for processing position data
-        self.pos_net = th.nn.Sequential(th.nn.Linear(pos_dim, 64), th.nn.ReLU())
+        # Old position features network (keeping it commented out for future reference)
+        # self.pos_net = th.nn.Sequential(th.nn.Linear(pos_dim, 64), th.nn.ReLU())
+        
+        # LSTM for position features
+        self.lstm_hidden_size = 64
+        self.pos_lstm = th.nn.LSTM(
+            input_size=pos_dim,
+            hidden_size=self.lstm_hidden_size,
+            num_layers=1,
+            batch_first=True
+        )
 
         # Create a network for processing action history
         self.action_history_net = th.nn.Sequential(
@@ -495,11 +526,24 @@ class VisionExtractor(BaseFeaturesExtractor):
 
         # Process position features
         pos_obs = th.as_tensor(observations["position"]).float()
-
-        # Add batch dimension if needed
-        if pos_obs.dim() == 1:
-            pos_obs = pos_obs.unsqueeze(0)  # (2,) -> (1,2)
-        pos_features = self.pos_net(pos_obs)
+        
+        # Old position features implementation
+        # if pos_obs.dim() == 1:
+        #     pos_obs = pos_obs.unsqueeze(0)  # (2,) -> (1,2)
+        # pos_features = self.pos_net(pos_obs)
+        
+        # LSTM for position features
+        # Reshape if needed
+        if pos_obs.dim() == 2:  # (10, 2) -> (1, 10, 2) for batch processing
+            pos_obs = pos_obs.unsqueeze(0)
+        elif pos_obs.dim() == 3 and pos_obs.shape[1] == 2:  # Old format (batch, 2) needs reshaping
+            # This is just a safeguard for compatibility with old code
+            pos_obs = pos_obs.unsqueeze(1)  # (batch, 2) -> (batch, 1, 2)
+        
+        # LSTM expects input of shape (batch, seq_len, input_size)
+        pos_features, _ = self.pos_lstm(pos_obs)
+        # Take the last sequence output
+        pos_features = pos_features[:, -1, :]
 
         # Process action history features
         action_history_obs = th.as_tensor(observations["action_history"]).float()
@@ -548,19 +592,26 @@ class CustomVecTranspose(VecTransposeImage):
         if isinstance(obs, (list, np.ndarray)):
             # For vectorized observations (e.g., from DummyVecEnv)
             visual_obs = obs[0]["visual"]  # Shape: (H, W, C) or (1, H, W, C)
-            position = obs[0]["position"]  # Shape: (2,) or (1, 2)
+            position = obs[0]["position"]  # Shape: (10, 2) or (1, 10, 2) with history, (2,) or (1, 2) for single position
             action_history = obs[0]["action_history"]  # Shape: (10,) or (1, 10)
         else:
             # For single observations (e.g., during evaluation)
             visual_obs = obs["visual"]  # Shape: (H, W, C)
-            position = obs["position"]  # Shape: (2,)
+            position = obs["position"]  # Shape: (10, 2) with position history, (2,) or (1, 2) for single position
             action_history = obs["action_history"]  # Shape: (10,)
 
         # Remove any extra batch dimension from DummyVecEnv if present
         if len(visual_obs.shape) == 4:
             visual_obs = visual_obs[0]  # Convert (1, H, W, C) to (H, W, C)
-        if len(position.shape) == 2:
-            position = position[0]  # Convert (1, 2) to (2,)
+            
+        # remove batch dimension if necessary but keep the history dimension
+        if len(position.shape) == 3:  # (1, 10, 2) -> (10, 2)
+            position = position[0]
+            
+        # Original position handling (commented out)
+        # if len(position.shape) == 2:
+        #     position = position[0]  # Convert (1, 2) to (2,)
+            
         if len(action_history.shape) == 2:
             action_history = action_history[0]  # Convert (1, 10) to (10,)
 
@@ -676,17 +727,18 @@ model = RecurrentPPO(
     learning_rate=3e-4,
     # n_steps=2048,
     # batch_size=64,
-    n_steps=4096,
-    batch_size=128,
+    n_steps=8192,
+    batch_size=64,
     ent_coef=0.01,
     tensorboard_log=os.path.join("Training", "Logs"),
     device=device,
+    n_epochs=10
 )
 
 # ==== Training ====
 
 # Training with checkpointing
-total_timesteps = 1000000
+total_timesteps = 5000000
 check_freq = 25000  # Save checkpoint every 25k steps
 MODEL_TAG = "RecurrentPPO"
 
